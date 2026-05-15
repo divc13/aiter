@@ -123,6 +123,33 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         ]
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
+        # Long-kv num_kv_splits extension.
+        #
+        # The loop above iterates i in [1..16], so num_kv_splits is capped at 16
+        # regardless of sequence length. At low bs with long kv (e.g. ~160k
+        # context at bs=4), bs*NS=64 fills only 25% of a 256-CU GPU and leaves
+        # the rest idle per stage1 launch. Extending NS up to cu_num/bs (capped
+        # at 64) recovers that parallelism.
+        #
+        # Measured on (nhead=16, qseqlen=1, gqaratio=16, fp8) at bs=4:
+        #   kv=34816  NS=16  48.3 us -> NS=34  38.2 us  (-10.1 us/call)
+        #   kv=65536  NS=16  80.8 us -> NS=64  51.2 us  (-29.6 us/call)
+        #   kv=131072 NS=16 152   us -> NS=64  72.5 us  (-79.8 us/call)
+        #   kv=163840 NS=16 189   us -> NS=64  89.8 us  (-99.2 us/call)
+        #
+        # Above NS=64 the combine stage dominates (work ~ bs*nhead*Lv*NS) so
+        # the cap stays at 64 even when cu_num/bs is higher. The extension
+        # only fires when (a) there is real slack (bs*NS < cu_num) and
+        # (b) avg_kv is large enough that per-split work still exceeds ~1
+        # tile of min_block_n, so it never shrinks per-split work below what
+        # the ASM kernel expects. At short kv (<32k) this is a strict no-op.
+        if bs * num_kv_splits < cu_num and avg_kv >= 32768:
+            work_ns = max(1, int(avg_kv // 1024))
+            cu_ns = max(1, cu_num // max(1, bs))
+            new_ns = min(work_ns, cu_ns, 64)
+            if new_ns > num_kv_splits:
+                num_kv_splits = new_ns
+
     get_block_n_fp8 = {
         8: 64,
         16: 128,
