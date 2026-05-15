@@ -338,6 +338,14 @@ def fused_moe_(
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
         block_size_M = int(block_size_M)
+    # Multi-phase MoeSorting (policy=2) is faster at very small batch due to
+    # reduced launch overhead relative to the work per expert. Measured on
+    # MI355X: ~-8 us/call per shape at M<=16 which maps to ~500 us/step at
+    # CONC=4. Only overrides when caller passed the default (auto=0) so
+    # explicit callers keep control.
+    _sort_dispatch_policy = moe_sorting_dispatch_policy
+    if _sort_dispatch_policy == 0 and M <= 16:
+        _sort_dispatch_policy = 2
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
         topk_weight,
@@ -347,7 +355,7 @@ def fused_moe_(
         block_size_M,
         expert_mask,
         num_local_tokens,
-        moe_sorting_dispatch_policy,
+        _sort_dispatch_policy,
     )
 
     if metadata.run_1stage:
